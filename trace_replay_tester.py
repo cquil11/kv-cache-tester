@@ -241,6 +241,8 @@ class TestConfig:
     # Trace advancement: start users partway through their traces
     advance_min: float = 0.0  # Minimum start position as fraction (0.0-1.0)
     advance_max: float = 0.0  # Maximum start position as fraction (0.0-1.0)
+    # Parallel subagents: spawn subagent requests as concurrent sessions
+    parallel_subagents: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -348,21 +350,43 @@ def normalize_request(req: dict, base_time: float) -> dict:
     }
 
 
-def flatten_requests(requests: list, base_time: float) -> list:
+def flatten_requests(requests: list, base_time: float, preserve_subagents: bool = False) -> list:
     """Flatten requests including subagents into a single timeline.
 
     Subagents have type='subagent' with their own nested requests array.
     Their timestamps are relative to the subagent start time.
+
+    Args:
+        requests: List of request dicts from trace
+        base_time: Base timestamp offset
+        preserve_subagents: If True, keep subagent entries as markers instead of
+            flattening their requests. Used for parallel subagent execution.
     """
     result = []
     for req in requests:
         if req.get('type') == 'subagent':
-            # Recursively flatten subagent requests with adjusted timestamps
-            subagent_requests = flatten_requests(
-                req.get('requests', []),
-                base_time=base_time + req.get('t', 0.0)
-            )
-            result.extend(subagent_requests)
+            if preserve_subagents:
+                # Keep subagent as a marker in the parent timeline
+                result.append({
+                    'type': 'subagent_marker',
+                    'timestamp': base_time + req.get('t', 0.0),
+                    'agent_id': req.get('agent_id', 'unknown'),
+                    'subagent_type': req.get('subagent_type', 'unknown'),
+                    'models': req.get('models', []),
+                    'tool_tokens': req.get('tool_tokens', 0),
+                    'system_tokens': req.get('system_tokens', 0),
+                    'duration_ms': req.get('duration_ms', 0),
+                    # Store raw subagent requests for spawning later
+                    'subagent_requests': req.get('requests', []),
+                })
+            else:
+                # Recursively flatten subagent requests with adjusted timestamps
+                subagent_requests = flatten_requests(
+                    req.get('requests', []),
+                    base_time=base_time + req.get('t', 0.0),
+                    preserve_subagents=False,
+                )
+                result.extend(subagent_requests)
         else:
             result.append(normalize_request(req, base_time))
 
@@ -371,24 +395,30 @@ def flatten_requests(requests: list, base_time: float) -> list:
     return result
 
 
-def normalize_trace(trace: dict) -> dict:
+def normalize_trace(trace: dict, preserve_subagents: bool = False) -> dict:
     """Convert new trace format to internal normalized format.
 
     New format has compact field names (t, in, out) and subagent support.
     This normalizes to the internal format expected by the rest of the code.
-    """
-    requests = flatten_requests(trace.get('requests', []), base_time=0.0)
 
-    # Compute stats from flattened requests
-    total_input_tokens = sum(r['input_tokens'] for r in requests)
+    Args:
+        trace: Raw trace dict
+        preserve_subagents: If True, keep subagent entries as markers for parallel execution
+    """
+    requests = flatten_requests(trace.get('requests', []), base_time=0.0,
+                                preserve_subagents=preserve_subagents)
+
+    # Compute stats from flattened requests (skip subagent markers)
+    actual_requests = [r for r in requests if r.get('type') != 'subagent_marker']
+    total_input_tokens = sum(r['input_tokens'] for r in actual_requests)
 
     # Compute cache hit rate from hash_ids if available
     cache_hits = 0
     total_blocks = 0
-    for i, req in enumerate(requests):
+    for i, req in enumerate(actual_requests):
         hash_ids = req.get('hash_ids', [])
         if i > 0 and hash_ids:
-            prev_hash_ids = set(requests[i-1].get('hash_ids', []))
+            prev_hash_ids = set(actual_requests[i-1].get('hash_ids', []))
             # Count how many blocks at the start match previous request
             for h in hash_ids:
                 total_blocks += 1
@@ -424,11 +454,13 @@ def normalize_trace(trace: dict) -> dict:
 class TraceManager:
     """Manages loading and sampling of conversation traces"""
 
-    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, seed: Optional[int] = None):
+    def __init__(self, trace_dir: Path, max_context: int, min_requests: int = 1, seed: Optional[int] = None,
+                 parallel_subagents: bool = False):
         self.trace_dir = trace_dir
         self.max_context = max_context
         self.min_requests = min_requests
         self.seed = seed
+        self.parallel_subagents = parallel_subagents
         self.traces: List[dict] = []
         self.used_trace_ids: Set[str] = set()
         self.stats: Optional[TraceStats] = None
@@ -455,7 +487,7 @@ class TraceManager:
             try:
                 with open(filepath) as f:
                     trace = json.load(f)
-                    trace = normalize_trace(trace)  # Convert new format to internal format
+                    trace = normalize_trace(trace, preserve_subagents=self.parallel_subagents)
                     trace['_filepath'] = str(filepath)
                     all_traces.append(trace)
             except Exception as e:
@@ -957,6 +989,130 @@ class SyntheticMessageGenerator:
 
 
 # =============================================================================
+# Subagent Session (lightweight session for parallel subagent execution)
+# =============================================================================
+
+class SubagentSession:
+    """Lightweight session for running a subagent's requests in parallel with the parent.
+
+    Similar to UserSession but:
+    - Has its own conversation context (separate from parent)
+    - Has its own tool_tokens/system_tokens
+    - Runs independently as an async task
+    - Reports metrics back to the orchestrator
+    """
+
+    def __init__(self, parent_user_id: str, agent_id: str, subagent_type: str,
+                 raw_requests: list, launch_time: float,
+                 generator: SyntheticMessageGenerator, max_context: int,
+                 models: list = None, tool_tokens: int = 0, system_tokens: int = 0):
+        self.session_id = f"{parent_user_id}_sub_{agent_id}"
+        self.parent_user_id = parent_user_id
+        self.agent_id = agent_id
+        self.subagent_type = subagent_type
+        self.generator = generator
+        self.max_context = max_context
+        self.models = models or []
+        self.tool_tokens = tool_tokens
+        self.system_tokens = system_tokens
+        self.launch_time = launch_time
+
+        # Normalize requests with timestamps relative to launch
+        self.requests = []
+        for req in raw_requests:
+            if req.get('type') != 'subagent':  # Don't support nested subagents for now
+                self.requests.append(normalize_request(req, base_time=0.0))
+        self.requests.sort(key=lambda r: r['timestamp'])
+
+        self.current_idx = 0
+        self.conversation: List[dict] = []
+        self.metrics: List[RequestMetrics] = []
+        self.prev_request_hash_ids: Set[int] = set()
+        self.prev_input_tokens: int = 0
+        self.stored_response_tokens: int = 0
+        self.token_shortfall: int = 0
+
+    def get_next_request(self) -> Optional[dict]:
+        if self.current_idx >= len(self.requests):
+            return None
+        request = self.requests[self.current_idx]
+        if request['input_tokens'] > self.max_context:
+            return None
+        return request
+
+    def get_delay_until_next(self) -> float:
+        if self.current_idx == 0 or self.current_idx >= len(self.requests):
+            return 0.0
+        prev_ts = self.requests[self.current_idx - 1]['timestamp']
+        curr_ts = self.requests[self.current_idx]['timestamp']
+        return max(0.0, curr_ts - prev_ts)
+
+    def build_messages(self, request: dict) -> Tuple[List[dict], int]:
+        """Build messages for this subagent request (simplified version of UserSession.build_messages)."""
+        max_tokens = max(1, request.get('output_tokens', 100))
+        current_hash_ids = set(request.get('hash_ids', []))
+        current_input_tokens = request.get('input_tokens', 0)
+
+        # Request pair: same hash_ids as previous
+        if current_hash_ids == self.prev_request_hash_ids and len(current_hash_ids) > 0:
+            return list(self.conversation), max_tokens
+
+        # Calculate token delta
+        if self.current_idx == 0:
+            tokens_to_generate = current_input_tokens
+        else:
+            token_delta = current_input_tokens - self.prev_input_tokens
+            tokens_to_generate = max(0, token_delta - self.stored_response_tokens + self.token_shortfall)
+
+        self.token_shortfall = 0
+        self.stored_response_tokens = 0
+
+        if tokens_to_generate > 0:
+            seed = hash(f"{self.session_id}_{self.current_idx}_{tokens_to_generate}") % (2**32)
+            input_types = request.get('input_types', [])
+            msg_type = 'tool_result' if 'tool_result' in input_types else 'text'
+            new_msg = self.generator.build_user_message(tokens_to_generate, msg_type, seed)
+            self.conversation.append(new_msg)
+
+        self.prev_request_hash_ids = current_hash_ids
+        self.prev_input_tokens = current_input_tokens
+
+        if not self.conversation:
+            seed = hash(f"{self.session_id}_{self.current_idx}_fallback") % (2**32)
+            self.conversation.append(self.generator.build_user_message(max(100, current_input_tokens), 'text', seed))
+
+        return list(self.conversation), max_tokens
+
+    def store_response(self, response_text: str, response_tokens: int, request: dict):
+        """Store assistant response."""
+        current_hash_ids = set(request.get('hash_ids', []))
+        next_idx = self.current_idx + 1
+        if next_idx < len(self.requests):
+            next_req = self.requests[next_idx]
+            next_hash_ids = set(next_req.get('hash_ids', []))
+            if current_hash_ids == next_hash_ids:
+                return  # Pair: don't store yet
+        self.conversation.append({"role": "assistant", "content": response_text})
+        self.stored_response_tokens = response_tokens
+
+    def advance(self):
+        if self.current_idx < len(self.requests):
+            self.current_idx += 1
+
+    def record_shortfall(self, expected: int, actual: int):
+        if expected > 0 and actual < expected * 0.8:
+            self.token_shortfall = expected - actual
+
+    def calculate_cache_hits(self, request: dict) -> Tuple[int, int]:
+        current_hash_ids = set(request.get('hash_ids', []))
+        if not self.prev_request_hash_ids:
+            return 0, len(current_hash_ids)
+        hits = len(current_hash_ids & self.prev_request_hash_ids)
+        misses = len(current_hash_ids) - hits
+        return hits, misses
+
+
+# =============================================================================
 # Trace Advancement Helpers
 # =============================================================================
 
@@ -1014,7 +1170,7 @@ def adjust_for_request_pairs(requests: list, start_idx: int) -> int:
 
 def skip_subagent_markers(requests: list, start_idx: int) -> int:
     """Skip past any subagent markers at start position."""
-    while start_idx < len(requests) and requests[start_idx].get('type') == 'subagent':
+    while start_idx < len(requests) and requests[start_idx].get('type') in ('subagent', 'subagent_marker'):
         start_idx += 1
     return start_idx
 
@@ -1026,7 +1182,7 @@ def get_first_real_request(requests: list) -> Optional[dict]:
     This helper skips them to find the first actual request.
     """
     for req in requests:
-        if req.get('type') != 'subagent':
+        if req.get('type') not in ('subagent', 'subagent_marker'):
             return req
     return None
 
@@ -1093,12 +1249,19 @@ class UserSession:
         return self.current_idx
 
     def get_next_request(self) -> Optional[dict]:
-        """Get next request to process, or None if done/truncated"""
+        """Get next request to process, or None if done/truncated.
+
+        Returns subagent_marker entries as-is for the orchestrator to handle.
+        """
         if self.current_idx >= len(self.requests):
             self.state = "completed"
             return None
 
         request = self.requests[self.current_idx]
+
+        # Subagent markers are returned directly for the orchestrator to spawn
+        if request.get('type') == 'subagent_marker':
+            return request
 
         # Check context limit
         if request['input_tokens'] > self.max_context:
@@ -2169,9 +2332,36 @@ class TestOrchestrator:
                               f"may be constraining throughput. Consider increasing --max-concurrent-requests{Colors.ENDC}")
 
     async def run_user_request(self, user: UserSession) -> Optional[RequestMetrics]:
-        """Execute a single request for a user"""
+        """Execute a single request for a user.
+
+        If the request is a subagent marker, spawns the subagent as a parallel
+        async task and immediately returns (so the parent can continue).
+        """
         request = user.get_next_request()
         if request is None:
+            return None
+
+        # Handle subagent markers: spawn parallel session, advance parent, return
+        if request.get('type') == 'subagent_marker':
+            sub = SubagentSession(
+                parent_user_id=user.user_id,
+                agent_id=request['agent_id'],
+                subagent_type=request['subagent_type'],
+                raw_requests=request['subagent_requests'],
+                launch_time=time.time(),
+                generator=self.generator,
+                max_context=self.config.max_context,
+                models=request.get('models', []),
+                tool_tokens=request.get('tool_tokens', 0),
+                system_tokens=request.get('system_tokens', 0),
+            )
+            # Fire and forget — runs in parallel with parent
+            asyncio.create_task(self.run_subagent(sub))
+            user.advance()
+            user.last_request_time = time.time()
+            user.state = "idle"  # Parent immediately ready for next request
+            # Don't count this as an in-flight request (the subagent manages its own)
+            self.in_flight_requests -= 1  # Undo the increment from dispatch
             return None
 
         user.state = "active"
@@ -2296,6 +2486,117 @@ class TestOrchestrator:
             user.state = "idle"
 
         return metrics
+
+    async def run_subagent(self, sub: SubagentSession) -> List[RequestMetrics]:
+        """Run a subagent session to completion, processing all its requests sequentially.
+
+        Returns list of metrics for all completed requests.
+        Called as an async task — runs in parallel with the parent session.
+        """
+        results = []
+        logger.info(f"{Colors.USER}    🤖 {sub.session_id} spawned ({sub.subagent_type}, "
+                     f"{len(sub.requests)} requests){Colors.ENDC}")
+
+        while sub.current_idx < len(sub.requests):
+            request = sub.get_next_request()
+            if request is None:
+                break
+
+            # Delay between requests (scaled)
+            if sub.current_idx > 0:
+                delay = sub.get_delay_until_next()
+                capped_delay = min(delay, self.config.max_delay) * self.config.time_scale
+                if capped_delay > 0:
+                    await asyncio.sleep(capped_delay)
+
+            # Admission control
+            if (self.config.max_concurrent_requests and
+                self.in_flight_requests >= self.config.max_concurrent_requests):
+                # Wait for a slot to open
+                while (self.config.max_concurrent_requests and
+                       self.in_flight_requests >= self.config.max_concurrent_requests):
+                    await asyncio.sleep(0.1)
+
+            # Track working set
+            current_time = time.time()
+            trace_id = sub.session_id
+            for h in request.get('hash_ids', []):
+                key = (trace_id, h)
+                self.block_last_access[key] = current_time
+                self.block_access_order.append((current_time, key))
+
+            # Build messages and send
+            messages, max_tokens = sub.build_messages(request)
+            cache_hits, cache_misses = sub.calculate_cache_hits(request)
+            expected_output = request.get('output_tokens', 100)
+
+            first_token_received = False
+            def on_first_token():
+                nonlocal first_token_received
+                first_token_received = True
+                self.in_flight_decoding += 1
+
+            self.in_flight_requests += 1
+            try:
+                result = await self.api_client.send_request(
+                    messages, max_tokens, stream=True, on_first_token=on_first_token
+                )
+            finally:
+                self.in_flight_requests -= 1
+                if first_token_received:
+                    self.in_flight_decoding -= 1
+
+            response_text = result['response_text']
+            ttft = result['ttft']
+            ttlt = result['ttlt']
+            actual_output = result['output_tokens']
+
+            if result['error_type'] == "connection":
+                self.consecutive_connection_errors += 1
+                self.total_connection_errors += 1
+                if self.consecutive_connection_errors >= self.max_consecutive_errors:
+                    self.running = False
+                    break
+            elif result['error_type'] is None:
+                self.consecutive_connection_errors = 0
+
+            sub.store_response(response_text, actual_output, request)
+            sub.record_shortfall(expected_output, actual_output)
+
+            itl = (ttlt - ttft) / (actual_output - 1) if actual_output > 1 and ttlt > ttft else 0
+
+            metrics = RequestMetrics(
+                user_id=sub.session_id,
+                request_idx=sub.current_idx,
+                trace_id=sub.session_id,
+                timestamp=time.time(),
+                request_type=request['type'],
+                input_tokens=request['input_tokens'],
+                output_tokens_expected=expected_output,
+                output_tokens_actual=actual_output,
+                cache_hit_blocks=cache_hits,
+                cache_miss_blocks=cache_misses,
+                ttft=ttft,
+                ttlt=ttlt,
+                itl=itl,
+                delay_expected=sub.get_delay_until_next() if sub.current_idx > 0 else 0,
+                delay_actual=0,
+                success=result['error_type'] is None,
+                error_message=str(result.get('error_type', '')),
+                request_start_time=result['start_time'],
+                prefill_complete_time=result['first_token_time'],
+                request_complete_time=result['complete_time'],
+                token_timestamps=result['token_timestamps'],
+                tokens_per_chunk=result['tokens_per_chunk'],
+            )
+            results.append(metrics)
+            self.all_metrics.append(metrics)
+
+            sub.advance()
+
+        logger.info(f"{Colors.USER}    🤖 {sub.session_id} finished "
+                     f"({sub.current_idx}/{len(sub.requests)} requests){Colors.ENDC}")
+        return results
 
     async def run(self):
         """Main test loop"""
@@ -2914,6 +3215,9 @@ def parse_arguments():
                         help="Minimum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
     parser.add_argument("--advance-max", type=float, default=0.0,
                         help="Maximum start position as fraction (0.0-1.0). Default: 0.0 (beginning)")
+    parser.add_argument("--parallel-subagents", action="store_true",
+                        help="Spawn subagent requests as parallel concurrent sessions "
+                             "instead of flattening into the parent timeline")
 
     return parser.parse_args()
 
@@ -2965,7 +3269,8 @@ async def main():
         max_concurrent_requests=args.max_concurrent_requests,
         warm_prefix_pct=args.warm_prefix_pct,
         advance_min=args.advance_min,
-        advance_max=args.advance_max
+        advance_max=args.advance_max,
+        parallel_subagents=args.parallel_subagents,
     )
 
     # Print header
@@ -2974,7 +3279,8 @@ async def main():
     logger.info(f"{Colors.PHASE}{'='*120}{Colors.ENDC}")
 
     # Load traces
-    trace_manager = TraceManager(Path(config.trace_directory), config.max_context, config.min_requests, config.seed)
+    trace_manager = TraceManager(Path(config.trace_directory), config.max_context, config.min_requests, config.seed,
+                                    parallel_subagents=config.parallel_subagents)
     num_traces = trace_manager.load_traces()
 
     if num_traces == 0:
@@ -3015,6 +3321,8 @@ async def main():
         logger.info(f"  Warm Prefix: disabled")
     if config.advance_max > 0:
         logger.info(f"  Trace Advancement: {config.advance_min:.0%} - {config.advance_max:.0%}")
+    if config.parallel_subagents:
+        logger.info(f"  Parallel Subagents: enabled")
     logger.info(f"{Colors.HEADER}{'=' * 120}{Colors.ENDC}")
 
     # Initialize components
