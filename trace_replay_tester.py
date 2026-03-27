@@ -497,7 +497,11 @@ class TraceManager:
         self.traces = []
         for trace in all_traces:
             if trace['requests']:
-                first_input = trace['requests'][0]['input_tokens']
+                # Find first actual request (skip subagent markers)
+                first_req = get_first_real_request(trace['requests'])
+                if first_req is None:
+                    continue
+                first_input = first_req['input_tokens']
                 num_requests = len(trace['requests'])
                 # Allow if first request fits and has enough requests
                 if first_input <= self.max_context and num_requests >= self.min_requests:
