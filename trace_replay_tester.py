@@ -1121,6 +1121,11 @@ def calculate_start_index(requests: list, rng: random.Random,
                           max_context: int = 0) -> int:
     """Calculate starting request index based on advancement range.
 
+    Uses an exponential distribution that heavily favors starting near the
+    beginning of the trace (turn 0), with exponentially decreasing probability
+    of starting later. This models realistic production traffic where most
+    users are starting new conversations, with some returning to existing ones.
+
     Args:
         requests: List of trace requests
         rng: Random number generator for deterministic selection
@@ -1148,7 +1153,13 @@ def calculate_start_index(requests: list, rng: random.Random,
     if min_idx >= max_idx:
         return min_idx
 
-    return rng.randint(min_idx, max_idx)
+    # Exponential distribution: heavily favor early positions.
+    # Sample from exponential(lambda=5), clamp to [0, 1], then scale to index range.
+    # ~42% start in first 10%, ~91% in first half. Rare but possible to start late.
+    raw = rng.expovariate(5.0)  # Mean = 1/5
+    normalized = min(raw, 1.0)  # Clamp to [0, 1]
+    idx = min_idx + int(normalized * (max_idx - min_idx))
+    return min(idx, max_idx)
 
 
 def adjust_for_request_pairs(requests: list, start_idx: int) -> int:
