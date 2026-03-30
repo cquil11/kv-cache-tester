@@ -2627,7 +2627,7 @@ class TestOrchestrator:
 
         # Warn if initial users exceed budgets
         initial_new_tokens = sum(
-            user.trace['requests'][0]['input_tokens']
+            (get_first_real_request(user.trace['requests']) or {}).get('input_tokens', 0)
             for user in self.users.values()
         )
         if initial_new_tokens > self.config.max_new_tokens_per_period:
